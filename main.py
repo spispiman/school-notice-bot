@@ -29,7 +29,7 @@ import feedparser
 import google.generativeai as genai
 
 STATE_FILE = "last_checked.json"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT = 15
 
 
