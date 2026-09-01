@@ -143,6 +143,33 @@ def send_line_message(token: str, group_id: str, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 組合彙整訊息
+# ---------------------------------------------------------------------------
+def build_digest_message(matched_items: list[dict]) -> str:
+    """
+    把所有符合條件的公告組成一則訊息，格式：
+
+    【校網公告小幫手】2026/09/01
+    1.公告名稱
+    公告頁面連結
+    2.公告名稱
+    公告頁面連結
+    ⚠️AI工具可能出錯
+    重要公告請自行留意校網首頁
+    """
+    today = datetime.now(timezone.utc).astimezone().strftime("%Y/%m/%d")
+    lines = [f"【校網公告小幫手】{today}"]
+
+    for i, item in enumerate(matched_items, start=1):
+        lines.append(f"{i}.{item['title']}")
+        lines.append(item["link"])
+
+    lines.append("⚠️AI工具可能出錯")
+    lines.append("重要公告請自行留意校網首頁")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -165,7 +192,7 @@ def main() -> None:
     new_items = filter_new(announcements, state)
     print(f"其中 {len(new_items)} 則為新公告")
 
-    matched_count = 0
+    matched_items = []
     for item in new_items:
         try:
             result = check_with_gemini(item, criteria, gemini_key)
@@ -176,16 +203,14 @@ def main() -> None:
         print(f"- {item['title']} -> {result}")
 
         if result.get("is_match"):
-            matched_count += 1
-            msg = (
-                "📢 新公告通知\n"
-                f"標題：{item['title']}\n"
-                f"日期：{item['date']}\n"
-                f"原因：{result.get('reason', '')}\n"
-                f"連結：{item['link']}"
-            )
-            send_line_message(line_token, line_group, msg)
-            time.sleep(1)  # 避免瞬間打爆 LINE API
+            matched_items.append(item)
+
+    # 有符合條件的公告才發送一則彙整訊息；一次執行只發一則，不逐篇推播
+    if matched_items:
+        msg = build_digest_message(matched_items)
+        send_line_message(line_token, line_group, msg)
+    else:
+        print("本次沒有符合條件的公告，不推播。")
 
     # 更新狀態：以「這次抓到的公告清單」作為下次比對基準
     # （校網公告列表頁通常只顯示最近 N 筆，用完整清單取代即可，
@@ -194,7 +219,7 @@ def main() -> None:
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
-    print(f"完成。共推播 {matched_count} 則。")
+    print(f"完成。共 {len(matched_items)} 則公告納入本次推播。")
 
 
 if __name__ == "__main__":
