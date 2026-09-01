@@ -1,13 +1,22 @@
 """
 校網公告自動化智慧篩選與推播系統
 =================================
-流程：
+流程（快取版）：
 1. 讀取 last_checked.json（上次已看過的公告 ID 清單）
 2. 透過學校網站的 RSS 訂閱抓取公告列表
 3. 找出「新」公告（不在 last_checked.json 裡的）
 4. 對每則新公告呼叫 Gemini API，判斷是否符合 USER_CRITERIA
-5. 符合的話推播到 LINE 群組
-6. 更新 last_checked.json（交給 GitHub Actions 去 commit）
+5. 符合的公告不會馬上發送，而是先存進 pending_matches.json（暫存清單）
+6. 只有當這次執行的「台灣時間小時」落在 DIGEST_HOURS 指定的時間點，
+   才會把暫存清單裡累積的所有公告，一次組成一則訊息推播到 LINE 群組，
+   發送完畢後清空暫存清單
+7. 更新 last_checked.json（交給 GitHub Actions 去 commit）
+
+這個設計讓「多久檢查一次」跟「多久通知一次」分開：
+可以把排程設定得很密集（例如每小時跑一次），確保不會因為
+RSS 只顯示最新 10 則、公告發布速度快，而漏抓公告；
+但通知本身只會在你指定的時間點（例如早上 6 點、下午 4 點）發送，
+不會因為檢查得勤而變成一直跳訊息轟炸群組。
 
 本版針對「臺北市立成功高級中學」設定，直接讀取該校的 RSS 訂閱網址
 （例如 https://www.cksh.tp.edu.tw/category/news/feed/ ），
@@ -22,19 +31,21 @@ import re
 import sys
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 import feedparser
 import google.generativeai as genai
 
 STATE_FILE = "last_checked.json"
+PENDING_FILE = "pending_matches.json"
 GEMINI_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT = 15
+TAIWAN_TZ = timezone(timedelta(hours=8))
 
 
 # ---------------------------------------------------------------------------
-# 狀態讀寫
+# 狀態讀寫（已看過的公告 ID）
 # ---------------------------------------------------------------------------
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -46,6 +57,21 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# 暫存清單讀寫（已判斷符合條件、但還沒發送的公告）
+# ---------------------------------------------------------------------------
+def load_pending() -> list[dict]:
+    if os.path.exists(PENDING_FILE):
+        with open(PENDING_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_pending(pending: list[dict]) -> None:
+    with open(PENDING_FILE, "w", encoding="utf-8") as f:
+        json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +183,7 @@ def build_digest_message(matched_items: list[dict]) -> str:
     ⚠️AI工具可能出錯
     重要公告請自行留意校網首頁
     """
-    today = datetime.now(timezone.utc).astimezone().strftime("%Y/%m/%d")
+    today = datetime.now(TAIWAN_TZ).strftime("%Y/%m/%d")
     lines = [f"【校網公告小幫手】{today}"]
 
     for i, item in enumerate(matched_items, start=1):
@@ -170,6 +196,25 @@ def build_digest_message(matched_items: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 判斷這次執行是不是「該發送彙整訊息」的時間點
+# ---------------------------------------------------------------------------
+def is_digest_hour(digest_hours_env: str) -> bool:
+    """
+    DIGEST_HOURS 環境變數格式：逗號分隔的小時數字（台灣時間，24 小時制），
+    例如 "6,16" 代表早上 6 點跟下午 4 點。
+    只要目前台灣時間的「小時」落在這個清單裡，這次執行就會發送彙整訊息。
+    """
+    try:
+        hours = {int(h.strip()) for h in digest_hours_env.split(",") if h.strip()}
+    except ValueError:
+        print(f"[警告] DIGEST_HOURS 格式錯誤：{digest_hours_env!r}，本次不發送", file=sys.stderr)
+        return False
+
+    current_hour = datetime.now(TAIWAN_TZ).hour
+    return current_hour in hours
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -178,8 +223,10 @@ def main() -> None:
     line_token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
     line_group = os.environ["LINE_GROUP_ID"]
     criteria = os.environ.get("USER_CRITERIA", "")
+    digest_hours_env = os.environ.get("DIGEST_HOURS", "6,16")
 
     state = load_state()
+    pending = load_pending()
 
     try:
         announcements = fetch_announcements(target_url)
@@ -192,7 +239,7 @@ def main() -> None:
     new_items = filter_new(announcements, state)
     print(f"其中 {len(new_items)} 則為新公告")
 
-    matched_items = []
+    new_matches = 0
     for item in new_items:
         try:
             result = check_with_gemini(item, criteria, gemini_key)
@@ -203,14 +250,27 @@ def main() -> None:
         print(f"- {item['title']} -> {result}")
 
         if result.get("is_match"):
-            matched_items.append(item)
+            pending.append({"title": item["title"], "link": item["link"]})
+            new_matches += 1
 
-    # 有符合條件的公告才發送一則彙整訊息；一次執行只發一則，不逐篇推播
-    if matched_items:
-        msg = build_digest_message(matched_items)
+    print(f"本次新增 {new_matches} 則符合條件的公告到暫存清單（目前累積 {len(pending)} 則）")
+
+    # 先把暫存清單存檔，不論這次是不是發送時間點，都要保留累積結果
+    save_pending(pending)
+
+    if pending and is_digest_hour(digest_hours_env):
+        sent_count = len(pending)
+        msg = build_digest_message(pending)
         send_line_message(line_token, line_group, msg)
+        # 發送成功與否都清空暫存清單，避免失敗時卡住不斷重複堆積；
+        # 如果推播真的失敗，send_line_message 會印出錯誤訊息方便排查
+        pending = []
+        save_pending(pending)
+        print(f"完成。本次發送彙整訊息，共 {sent_count} 則公告已清空暫存。")
+    elif pending:
+        print(f"目前非發送時間點（DIGEST_HOURS={digest_hours_env}），先累積在暫存清單，暫不推播。")
     else:
-        print("本次沒有符合條件的公告，不推播。")
+        print("暫存清單目前是空的，不推播。")
 
     # 更新狀態：以「這次抓到的公告清單」作為下次比對基準
     # （校網公告列表頁通常只顯示最近 N 筆，用完整清單取代即可，
@@ -218,8 +278,6 @@ def main() -> None:
     state["last_ids"] = [a["id"] for a in announcements]
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
-
-    print(f"完成。共 {len(matched_items)} 則公告納入本次推播。")
 
 
 if __name__ == "__main__":
