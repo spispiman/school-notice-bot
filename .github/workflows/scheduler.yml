@@ -2,13 +2,13 @@ name: School Notice Bot
 
 on:
   schedule:
-    # cron 使用 UTC 時間。台灣時間 = UTC+8
-    - cron: '0 22 * * *'  # 台灣時間 06:00（前一天 UTC 22:00）
-    - cron: '0 8 * * *'   # 台灣時間 16:00
+    # cron 使用 UTC 時間。每小時的整點檢查一次（頻繁檢查，避免 RSS 只留最新 10 則導致漏抓）
+    # 實際「發訊息」的時間點由 main.py 裡的 DIGEST_HOURS 控制，跟這裡的檢查頻率是分開的
+    - cron: '0 * * * *'
   workflow_dispatch:  # 允許在 GitHub 網頁上手動觸發，方便測試
 
 permissions:
-  contents: write  # 需要寫入權限才能 commit 回 last_checked.json
+  contents: write  # 需要寫入權限才能 commit 回 last_checked.json / pending_matches.json
 
 jobs:
   run-bot:
@@ -32,12 +32,13 @@ jobs:
           LINE_GROUP_ID: ${{ secrets.LINE_GROUP_ID }}
           TARGET_URL: ${{ secrets.TARGET_URL }}
           USER_CRITERIA: ${{ secrets.USER_CRITERIA }}
+          DIGEST_HOURS: "6,16"  # 台灣時間，逗號分隔；只有這幾個小時才會真的發送彙整訊息
         run: python main.py
 
-      - name: Commit updated state file
+      - name: Commit updated state files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_checked.json
-          git diff --staged --quiet || git commit -m "chore: update last_checked.json [skip ci]"
+          git add last_checked.json pending_matches.json
+          git diff --staged --quiet || git commit -m "chore: update state files [skip ci]"
           git push
