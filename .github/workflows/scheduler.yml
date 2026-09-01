@@ -3,8 +3,8 @@ name: School Notice Bot
 on:
   schedule:
     # cron 使用 UTC 時間。台灣時間 = UTC+8
-    - cron: '0 0 * * *'   # 台灣時間 08:00
-    - cron: '0 10 * * *'  # 台灣時間 18:00
+    - cron: '0 22 * * *'  # 台灣時間 06:00（前一天 UTC 22:00）
+    - cron: '0 8 * * *'   # 台灣時間 16:00
   workflow_dispatch:  # 允許在 GitHub 網頁上手動觸發，方便測試
 
 permissions:
