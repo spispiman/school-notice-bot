@@ -6,7 +6,7 @@
 2. 透過學校網站的 RSS 訂閱抓取公告列表
 3. 找出「新」公告（不在 last_checked.json 裡的）
 4. 對每則新公告呼叫 Gemini API，判斷是否符合 USER_CRITERIA
-5. 符合的公告不會馬上發送，而是先存進 pending_matches.json（暫存清單）
+5. 符合的公告先把網址縮短，存進 pending_matches.json（暫存清單），不會馬上發送
 6. 只有當這次執行的「台灣時間小時」落在 DIGEST_HOURS 指定的時間點，
    才會把暫存清單裡累積的所有公告，一次組成一則訊息推播到 LINE 群組，
    發送完畢後清空暫存清單
@@ -151,6 +151,28 @@ def check_with_gemini(announcement: dict, criteria: str, api_key: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 縮短網址
+# ---------------------------------------------------------------------------
+def shorten_url(url: str) -> str:
+    """
+    用 TinyURL 的免費 API 把網址縮短，不需要註冊、不需要金鑰。
+    如果縮短失敗（例如網路問題、服務暫時掛掉），就直接回傳原本的完整網址，
+    確保就算縮網址這步出狀況，訊息還是照常能發送、連結還是能點。
+    """
+    try:
+        resp = requests.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": url},
+            timeout=10,
+        )
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+    except Exception as e:
+        print(f"[縮網址失敗，改用原網址] {e}", file=sys.stderr)
+    return url
+
+
+# ---------------------------------------------------------------------------
 # LINE 推播
 # ---------------------------------------------------------------------------
 def send_line_message(token: str, group_id: str, text: str) -> None:
@@ -250,7 +272,8 @@ def main() -> None:
         print(f"- {item['title']} -> {result}")
 
         if result.get("is_match"):
-            pending.append({"title": item["title"], "link": item["link"]})
+            short_link = shorten_url(item["link"])
+            pending.append({"title": item["title"], "link": short_link})
             new_matches += 1
 
     print(f"本次新增 {new_matches} 則符合條件的公告到暫存清單（目前累積 {len(pending)} 則）")
